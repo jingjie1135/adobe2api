@@ -203,12 +203,27 @@ def build_image_payload_candidates(
         base_payload["referenceBlobs"] = []
         return [base_payload]
 
+    candidates: list[dict] = []
     edited = dict(base_payload)
     edited["generationMetadata"] = {
         "module": "image2image",
         "submodule": "ff-image-generate",
     }
-    edited["referenceBlobs"] = [
+
+    c1 = dict(edited)
+    c1["referenceBlobs"] = [
         {"id": img_id, "usage": "general"} for img_id in source_image_ids
     ]
-    return [edited]
+    candidates.append(c1)
+
+    c4 = dict(edited)
+    c4["referenceBlobs"] = []
+    c4["imagePrompt"] = {"referenceImage": source_image_ids[0]}
+    candidates.append(c4)
+
+    c5 = dict(edited)
+    c5["referenceBlobs"] = []
+    c5["imagePrompt"] = {"referenceImage": {"id": source_image_ids[0]}}
+    candidates.append(c5)
+
+    return candidates
