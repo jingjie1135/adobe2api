@@ -62,6 +62,26 @@ def _build_submit_nonce(token: str, prompt: str) -> str:
     return hashlib.sha256(nonce_input).hexdigest()
 
 
+def _build_arp_session_id() -> str:
+    ftr = (
+        f"{uuid.uuid4().hex}_{int(time.time() * 1000)}_"
+        f"{uuid.uuid4().int % 1000000}_dUAL43-mnts-ants-d4_31ck__tt"
+    )
+    payload = {
+        "sid": str(uuid.uuid4()),
+        "ftr": ftr,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def format_upstream_status_message(prefix: str, status_code: int, body: str) -> str:
+    message = f"{prefix}: {status_code} {str(body or '')[:300]}".strip()
+    if int(status_code) == 408:
+        message = f"{message} (check x-arp-session-id risk-control header)"
+    return message
+
+
 class AdobeRequestError(Exception):
     def __init__(
         self,
@@ -265,7 +285,7 @@ class AdobeClient:
             return "connection"
         return "network"
 
-    def _requests_proxies(self) -> Optional[dict]:
+    def _requests_proxies(self) -> Optional[dict[str, str]]:
         if not self.proxy:
             return None
         return {"http": self.proxy, "https": self.proxy}
@@ -278,7 +298,7 @@ class AdobeClient:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         return CurlSession(**kwargs)
 
-    def _browser_headers(self) -> dict:
+    def _browser_headers(self) -> dict[str, str]:
         return {
             "user-agent": self.user_agent,
             "origin": "https://firefly.adobe.com",
@@ -290,9 +310,10 @@ class AdobeClient:
             "sec-fetch-site": "same-site",
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
+            "x-arp-session-id": _build_arp_session_id(),
         }
 
-    def _submit_headers(self, token: str, prompt: str = "") -> dict:
+    def _submit_headers(self, token: str, prompt: str = "") -> dict[str, str]:
         headers = self._browser_headers()
         headers.update(
             {
@@ -307,7 +328,7 @@ class AdobeClient:
             headers["x-nonce"] = submit_nonce
         return headers
 
-    def _submit_headers_minimal(self, token: str) -> dict:
+    def _submit_headers_minimal(self, token: str) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {token}",
             "x-api-key": self.api_key,
@@ -315,7 +336,7 @@ class AdobeClient:
             "accept": "*/*",
         }
 
-    def _video_submit_headers(self, token: str) -> dict:
+    def _video_submit_headers(self, token: str) -> dict[str, str]:
         headers = self._browser_headers()
         headers.update(
             {
@@ -327,7 +348,7 @@ class AdobeClient:
         )
         return headers
 
-    def _poll_headers(self, token: str) -> dict:
+    def _poll_headers(self, token: str) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {token}",
             "accept": "*/*",
@@ -336,7 +357,7 @@ class AdobeClient:
             "user-agent": self.user_agent,
         }
 
-    def _entity_headers(self, token: str) -> dict:
+    def _entity_headers(self, token: str) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {token}",
             "x-api-key": self.api_key,
@@ -1305,12 +1326,16 @@ class AdobeClient:
         if submit_resp.status_code != 200:
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
                 raise UpstreamTemporaryError(
-                    f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
+                    format_upstream_status_message(
+                        "video submit failed", submit_resp.status_code, submit_resp.text
+                    ),
                     status_code=submit_resp.status_code,
                     error_type="status",
                 )
             raise AdobeRequestError(
-                f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
+                format_upstream_status_message(
+                    "video submit failed", submit_resp.status_code, submit_resp.text
+                )
             )
 
         submit_data = submit_resp.json()
@@ -1506,16 +1531,22 @@ class AdobeClient:
             )
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
                 raise UpstreamTemporaryError(
-                    f"submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
+                    format_upstream_status_message(
+                        "submit failed", submit_resp.status_code, submit_resp.text
+                    ),
                     status_code=submit_resp.status_code,
                     error_type="status",
                 )
             if last_error:
                 raise AdobeRequestError(
-                    f"submit failed: {submit_resp.status_code} {last_error}"
+                    format_upstream_status_message(
+                        "submit failed", submit_resp.status_code, last_error
+                    )
                 )
             raise AdobeRequestError(
-                f"submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
+                format_upstream_status_message(
+                    "submit failed", submit_resp.status_code, submit_resp.text
+                )
             )
 
         submit_data = submit_resp.json()
