@@ -1,20 +1,31 @@
 import json
+import hashlib
+import importlib
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from core.config_mgr import config_manager
-from core.token_mgr import token_manager
 
 
 BASE_DIR = Path(__file__).parent.parent
 CONFIG_DIR = BASE_DIR / "config"
 PROFILE_FILE = CONFIG_DIR / "refresh_profile.json"
+
+RefreshRecord = Dict[str, Any]
+token_manager: Any = None
+
+
+def _token_manager() -> Any:
+    global token_manager
+    if token_manager is None:
+        token_manager = getattr(importlib.import_module("core.token_mgr"), "token_manager")
+    return token_manager
 
 
 class RefreshManager:
@@ -29,7 +40,7 @@ class RefreshManager:
         self._lock = threading.Lock()
         self._runner_started = False
         self._stop_event = threading.Event()
-        self._profiles: List[Dict] = []
+        self._profiles: List[RefreshRecord] = []
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self._load_profiles()
 
@@ -49,7 +60,7 @@ class RefreshManager:
                 self._profiles = []
                 return
 
-            loaded: List[Dict] = []
+            loaded: List[RefreshRecord] = []
             now_ts = int(time.time())
             for item in profiles:
                 try:
@@ -67,7 +78,7 @@ class RefreshManager:
         PROFILE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @staticmethod
-    def _validate_bundle(bundle: Dict) -> Dict:
+    def _validate_bundle(bundle: RefreshRecord) -> RefreshRecord:
         if not isinstance(bundle, dict):
             raise ValueError("bundle must be an object")
 
@@ -128,7 +139,7 @@ class RefreshManager:
         }
 
     @classmethod
-    def _normalize_stored_profile(cls, profile: Dict, now_ts: int) -> Dict:
+    def _normalize_stored_profile(cls, profile: RefreshRecord, now_ts: int) -> RefreshRecord:
         if not isinstance(profile, dict):
             raise ValueError("invalid profile")
         endpoint = profile.get("endpoint")
@@ -140,13 +151,20 @@ class RefreshManager:
                 f"{validated['endpoint']['form']['client_id']}-{profile_id[:4]}"
             )
 
-        state = profile.get("state") if isinstance(profile.get("state"), dict) else {}
+        state_raw = profile.get("state")
+        state: RefreshRecord = state_raw if isinstance(state_raw, dict) else {}
         account_raw = profile.get("account")
-        account = account_raw if isinstance(account_raw, dict) else {}
+        account: RefreshRecord = account_raw if isinstance(account_raw, dict) else {}
         return {
             "id": profile_id,
             "name": profile_name,
             "enabled": bool(profile.get("enabled", True)),
+            "cookie_fingerprint": str(
+                profile.get("cookie_fingerprint")
+                or cls._cookie_fingerprint(
+                    str(validated["endpoint"]["headers"].get("Cookie") or "")
+                )
+            ),
             "imported_at": int(profile.get("imported_at") or now_ts),
             "endpoint": validated["endpoint"],
             "account": {
@@ -198,13 +216,15 @@ class RefreshManager:
             return None
         return {"http": proxy, "https": proxy}
 
-    def _summary_locked(self, profile: Dict) -> Dict:
-        endpoint = profile.get("endpoint", {})
-        form = endpoint.get("form", {})
-        state = profile.get("state", {})
-        account = (
-            profile.get("account") if isinstance(profile.get("account"), dict) else {}
-        )
+    def _summary_locked(self, profile: RefreshRecord) -> RefreshRecord:
+        endpoint_raw = profile.get("endpoint")
+        endpoint: RefreshRecord = endpoint_raw if isinstance(endpoint_raw, dict) else {}
+        form_raw = endpoint.get("form")
+        form: RefreshRecord = form_raw if isinstance(form_raw, dict) else {}
+        state_raw = profile.get("state")
+        state: RefreshRecord = state_raw if isinstance(state_raw, dict) else {}
+        account_raw = profile.get("account")
+        account: RefreshRecord = account_raw if isinstance(account_raw, dict) else {}
         return {
             "id": profile.get("id"),
             "name": profile.get("name"),
@@ -229,7 +249,7 @@ class RefreshManager:
             "refresh_interval_hours": self._refresh_interval_hours(),
         }
 
-    def list_profiles(self) -> List[Dict]:
+    def list_profiles(self) -> List[RefreshRecord]:
         with self._lock:
             items = [self._summary_locked(p) for p in self._profiles]
         items.sort(key=lambda x: int(x.get("imported_at") or 0), reverse=True)
@@ -269,7 +289,23 @@ class RefreshManager:
             return "; ".join(pairs)
         return ""
 
-    def import_cookie(self, cookie_input, name: Optional[str] = None) -> Dict:
+    @staticmethod
+    def _normalize_cookie_for_fingerprint(cookie: str) -> str:
+        pairs = []
+        for part in str(cookie or "").split(";"):
+            item = part.strip()
+            if item:
+                pairs.append(item)
+        return "; ".join(sorted(pairs))
+
+    @classmethod
+    def _cookie_fingerprint(cls, cookie: str) -> str:
+        normalized = cls._normalize_cookie_for_fingerprint(cookie)
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def import_cookie(self, cookie_input, name: Optional[str] = None) -> RefreshRecord:
         cookie = self._cookie_string_from_input(cookie_input)
         if not cookie:
             raise ValueError("cookie is required")
@@ -297,6 +333,7 @@ class RefreshManager:
         )
 
         now_ts = int(time.time())
+        cookie_fingerprint = self._cookie_fingerprint(cookie)
         profile_id = uuid.uuid4().hex[:8]
         profile_name = str(name or "").strip()
         if not profile_name:
@@ -308,6 +345,7 @@ class RefreshManager:
             "id": profile_id,
             "name": profile_name,
             "enabled": True,
+            "cookie_fingerprint": cookie_fingerprint,
             "imported_at": now_ts,
             "endpoint": validated["endpoint"],
             "account": {
@@ -328,28 +366,40 @@ class RefreshManager:
         }
 
         with self._lock:
+            for existing in self._profiles:
+                if not cookie_fingerprint:
+                    continue
+                if str(existing.get("cookie_fingerprint") or "") != cookie_fingerprint:
+                    continue
+                existing["endpoint"] = validated["endpoint"]
+                existing["cookie_fingerprint"] = cookie_fingerprint
+                if str(name or "").strip():
+                    existing["name"] = str(name or "").strip()
+                self._save_profiles()
+                return self._summary_locked(existing)
+
             self._profiles.append(new_profile)
             self._save_profiles()
             return self._summary_locked(new_profile)
 
-    def export_cookies(self, ids: Optional[List[str]] = None) -> List[Dict]:
+    def export_cookies(self, ids: Optional[List[str]] = None) -> List[RefreshRecord]:
         selected_ids = None
         if isinstance(ids, list):
             normalized = [str(x or "").strip() for x in ids]
             selected_ids = {x for x in normalized if x}
         with self._lock:
-            out: List[Dict] = []
+            out: List[RefreshRecord] = []
             for p in self._profiles:
                 pid = str(p.get("id") or "").strip()
                 if selected_ids is not None and pid not in selected_ids:
                     continue
-                endpoint = (
-                    p.get("endpoint") if isinstance(p.get("endpoint"), dict) else {}
+                endpoint_raw = p.get("endpoint")
+                endpoint: RefreshRecord = (
+                    endpoint_raw if isinstance(endpoint_raw, dict) else {}
                 )
-                headers = (
-                    endpoint.get("headers")
-                    if isinstance(endpoint.get("headers"), dict)
-                    else {}
+                headers_raw = endpoint.get("headers")
+                headers: RefreshRecord = (
+                    headers_raw if isinstance(headers_raw, dict) else {}
                 )
                 cookie = str(headers.get("Cookie") or "").strip()
                 out.append(
@@ -371,7 +421,7 @@ class RefreshManager:
                 return None
             return bool(target.get("enabled", True))
 
-    def _find_profile_locked(self, profile_id: str) -> Optional[Dict]:
+    def _find_profile_locked(self, profile_id: str) -> Optional[RefreshRecord]:
         for p in self._profiles:
             if p.get("id") == profile_id:
                 return p
@@ -384,9 +434,9 @@ class RefreshManager:
                 raise KeyError("profile not found")
             self._profiles = [p for p in self._profiles if p.get("id") != profile_id]
             self._save_profiles()
-        token_manager.remove_auto_refresh_by_profile(profile_id)
+        _token_manager().remove_auto_refresh_by_profile(profile_id)
 
-    def set_enabled(self, profile_id: str, enabled: bool) -> Dict:
+    def set_enabled(self, profile_id: str, enabled: bool) -> RefreshRecord:
         with self._lock:
             target = self._find_profile_locked(profile_id)
             if not target:
@@ -400,12 +450,14 @@ class RefreshManager:
             self._save_profiles()
             return self._summary_locked(target)
 
-    def _prepare_refresh(self, profile_id: str) -> Dict:
+    def _prepare_refresh(
+        self, profile_id: str, allow_disabled_profile: bool = False
+    ) -> RefreshRecord:
         with self._lock:
             target = self._find_profile_locked(profile_id)
             if not target:
                 raise KeyError("profile not found")
-            if not bool(target.get("enabled", True)):
+            if not allow_disabled_profile and not bool(target.get("enabled", True)):
                 raise ValueError("profile is disabled")
             endpoint = target.get("endpoint", {})
             state = target.setdefault("state", {})
@@ -419,6 +471,38 @@ class RefreshManager:
             }
             self._save_profiles()
             return snapshot
+
+    def _resolve_account_profile_id(self, profile_id: str, account: RefreshRecord) -> str:
+        account_id = str(account.get("user_id") or "").strip()
+        if not account_id:
+            return str(profile_id or "").strip()
+
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                return str(profile_id or "").strip()
+
+            duplicate = None
+            for profile in self._profiles:
+                if profile.get("id") == profile_id:
+                    continue
+                account_raw = profile.get("account")
+                profile_account: RefreshRecord = (
+                    account_raw if isinstance(account_raw, dict) else {}
+                )
+                if str(profile_account.get("user_id") or "").strip() == account_id:
+                    duplicate = profile
+                    break
+
+            if duplicate is None:
+                return str(profile_id or "").strip()
+
+            duplicate["endpoint"] = target.get("endpoint", {})
+            duplicate["cookie_fingerprint"] = target.get("cookie_fingerprint", "")
+            _token_manager().remove_auto_refresh_by_profile(profile_id)
+            self._profiles = [p for p in self._profiles if p.get("id") != profile_id]
+            self._save_profiles()
+            return str(duplicate.get("id") or "").strip()
 
     def _mark_success(self, profile_id: str, http_status: int):
         with self._lock:
@@ -451,7 +535,7 @@ class RefreshManager:
             state["next_retry_at"] = time.time() + delay
             self._save_profiles()
 
-    def _fetch_account_info(self, access_token: str) -> Dict:
+    def _fetch_account_info(self, access_token: str) -> RefreshRecord:
         token = str(access_token or "").strip()
         if not token:
             return {}
@@ -504,7 +588,7 @@ class RefreshManager:
     @staticmethod
     def _extract_account_id(access_token: str) -> str:
         try:
-            payload = token_manager._decode_jwt_payload(access_token)  # type: ignore[attr-defined]
+            payload = _token_manager()._decode_jwt_payload(access_token)
         except Exception:
             payload = None
         if not isinstance(payload, dict):
@@ -513,7 +597,7 @@ class RefreshManager:
             payload.get("user_id") or payload.get("aa_id") or payload.get("sub") or ""
         ).strip()
 
-    def _fetch_credits_balance(self, access_token: str, account_id: str) -> Dict:
+    def _fetch_credits_balance(self, access_token: str, account_id: str) -> RefreshRecord:
         token = str(access_token or "").strip()
         aid = str(account_id or "").strip()
         if not token:
@@ -549,28 +633,29 @@ class RefreshManager:
             "updated_at": int(time.time()),
         }
 
-    def refresh_credits_for_token_id(self, token_id: str) -> Dict:
-        token_info = token_manager.get_by_id(token_id)
+    def refresh_credits_for_token_id(self, token_id: str) -> RefreshRecord:
+        token_info = _token_manager().get_by_id(token_id)
         if not token_info:
             raise KeyError("token not found")
         token_value = str(token_info.get("value") or "").strip()
         account_id = self._extract_account_id(token_value)
         credits = self._fetch_credits_balance(token_value, account_id)
-        token_manager.set_credits(token_id, credits)
+        _token_manager().set_credits(token_id, credits)
         return {
             "token_id": token_id,
             "credits": credits,
         }
 
-    def _set_profile_account(self, profile_id: str, account: Dict):
+    def _set_profile_account(self, profile_id: str, account: RefreshRecord):
         if not account:
             return
         with self._lock:
             target = self._find_profile_locked(profile_id)
             if not target:
                 return
-            current = (
-                target.get("account") if isinstance(target.get("account"), dict) else {}
+            current_raw = target.get("account")
+            current: RefreshRecord = (
+                current_raw if isinstance(current_raw, dict) else {}
             )
             merged = {
                 "display_name": str(
@@ -594,8 +679,12 @@ class RefreshManager:
                 target["name"] = display_name or email
             self._save_profiles()
 
-    def refresh_once(self, profile_id: str) -> Dict:
-        snapshot = self._prepare_refresh(profile_id)
+    def refresh_once(
+        self, profile_id: str, allow_disabled_profile: bool = False
+    ) -> RefreshRecord:
+        snapshot = self._prepare_refresh(
+            profile_id, allow_disabled_profile=allow_disabled_profile
+        )
         resp = requests.post(
             snapshot["url"],
             headers=snapshot["headers"],
@@ -634,8 +723,10 @@ class RefreshManager:
             raise RuntimeError("refresh response missing access_token")
 
         account = self._fetch_account_info(token)
+        target_profile_id = str(snapshot["id"] or "")
         if account:
-            self._set_profile_account(profile_id, account)
+            target_profile_id = self._resolve_account_profile_id(target_profile_id, account)
+            self._set_profile_account(target_profile_id, account)
 
         profile_name = str(
             account.get("display_name")
@@ -645,9 +736,9 @@ class RefreshManager:
         ).strip()
         profile_email = str(account.get("email") or "").strip()
 
-        token_record = token_manager.upsert_auto_refresh_token(
+        token_record = _token_manager().upsert_auto_refresh_token(
             token,
-            profile_id=snapshot["id"],
+            profile_id=target_profile_id,
             profile_name=profile_name,
             profile_email=profile_email,
         )
@@ -659,13 +750,13 @@ class RefreshManager:
                 self.refresh_credits_for_token_id(token_id)
             except Exception as exc:
                 credits_error = str(exc)
-                token_manager.set_credits_error(token_id, credits_error)
+                _token_manager().set_credits_error(token_id, credits_error)
 
-        self._mark_success(profile_id, http_status=resp.status_code)
+        self._mark_success(target_profile_id, http_status=resp.status_code)
 
         return {
             "status": "ok",
-            "profile_id": snapshot["id"],
+            "profile_id": target_profile_id,
             "profile_name": profile_name,
             "profile_email": profile_email,
             "expires_in": data.get("expires_in"),

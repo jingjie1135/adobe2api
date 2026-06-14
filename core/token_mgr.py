@@ -6,7 +6,7 @@ import uuid
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -14,13 +14,15 @@ CONFIG_DIR = BASE_DIR / "config"
 DATA_FILE = CONFIG_DIR / "tokens.json"
 LEGACY_DATA_FILE = DATA_DIR / "tokens.json"
 
+TokenRecord = Dict[str, Any]
+
 
 class TokenManager:
     ERROR_COOLDOWN_SECONDS = 180
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.tokens: List[Dict] = []
+        self.tokens: List[TokenRecord] = []
         self._rr_index = 0
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
@@ -51,7 +53,7 @@ class TokenManager:
     def save(self):
         DATA_FILE.write_text(json.dumps(self.tokens, indent=2), encoding="utf-8")
 
-    def add(self, value: str, meta: Optional[Dict] = None):
+    def add(self, value: str, meta: Optional[TokenRecord] = None):
         with self._lock:
             value = value.strip()
             if value.startswith("Bearer "):
@@ -110,8 +112,9 @@ class TokenManager:
                     break
 
             if target is not None:
+                was_disabled = target.get("status") == "disabled"
                 target["value"] = value
-                target["status"] = "active"
+                target["status"] = "disabled" if was_disabled else "active"
                 target["fails"] = 0
                 target["error_until"] = 0
                 target["updated_at"] = now_ts
@@ -164,14 +167,14 @@ class TokenManager:
             ]
             self.save()
 
-    def get_by_id(self, tid: str) -> Optional[Dict]:
+    def get_by_id(self, tid: str) -> Optional[TokenRecord]:
         with self._lock:
             for t in self.tokens:
                 if t.get("id") == tid:
                     return dict(t)
         return None
 
-    def get_meta_by_value(self, value: str) -> Dict:
+    def get_meta_by_value(self, value: str) -> TokenRecord:
         token_value = str(value or "").strip()
         with self._lock:
             for t in self.tokens:
@@ -202,7 +205,7 @@ class TokenManager:
                         t["error_until"] = 0
             self.save()
 
-    def set_credits(self, tid: str, credits: Dict):
+    def set_credits(self, tid: str, credits: TokenRecord):
         with self._lock:
             for t in self.tokens:
                 if t.get("id") != tid:
@@ -238,7 +241,7 @@ class TokenManager:
 
     def _pick_active_token_locked(
         self, strategy: str = "round_robin"
-    ) -> Optional[Dict]:
+    ) -> Optional[TokenRecord]:
         active = [t for t in self.tokens if t.get("status") in {"active", "error"}]
         if not active:
             return None
@@ -290,7 +293,7 @@ class TokenManager:
             self._rr_index = (self._rr_index + 1) % max(1, len(self.tokens))
             return active[idx]["value"]
 
-    def list_active_account_tokens(self) -> List[Dict]:
+    def list_active_account_tokens(self) -> List[TokenRecord]:
         with self._lock:
             items = []
             seen = set()
@@ -328,7 +331,7 @@ class TokenManager:
                     t["error_until"] = 0
             self.save()
 
-    def handle_auth_failure(self, value: str) -> Dict:
+    def handle_auth_failure(self, value: str) -> TokenRecord:
         token_value = str(value or "").strip()
         linked_profile_id = ""
         linked_auto_refresh = False
@@ -352,6 +355,15 @@ class TokenManager:
 
         try:
             from core.refresh_mgr import refresh_manager
+
+            if refresh_manager.is_profile_enabled(linked_profile_id) is False:
+                self.report_invalid(token_value)
+                return {
+                    "status": "invalid",
+                    "message": "token expired and auto refresh is disabled",
+                    "http_status": 401,
+                    "profile_id": linked_profile_id,
+                }
 
             refresh_result = refresh_manager.refresh_once(linked_profile_id)
         except Exception as exc:
@@ -390,7 +402,7 @@ class TokenManager:
             self.save()
 
     @staticmethod
-    def _decode_jwt_payload(value: str) -> Optional[dict]:
+    def _decode_jwt_payload(value: str) -> Optional[TokenRecord]:
         token = str(value or "").strip()
         parts = token.split(".")
         if len(parts) < 2:
@@ -486,13 +498,13 @@ class TokenManager:
                 )
             return res
 
-    def export_tokens(self, ids: Optional[List[str]] = None) -> List[Dict]:
+    def export_tokens(self, ids: Optional[List[str]] = None) -> List[TokenRecord]:
         selected_ids = None
         if isinstance(ids, list):
             normalized = [str(x or "").strip() for x in ids]
             selected_ids = {x for x in normalized if x}
         with self._lock:
-            out: List[Dict] = []
+            out: List[TokenRecord] = []
             for t in self.tokens:
                 tid = str(t.get("id") or "").strip()
                 if selected_ids is not None and tid not in selected_ids:
