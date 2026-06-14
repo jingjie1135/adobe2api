@@ -316,7 +316,9 @@ def build_admin_router(
             )
 
         try:
-            result = refresh_manager.refresh_once(profile_id)
+            result = refresh_manager.refresh_once(
+                profile_id, allow_disabled_profile=True
+            )
             return {"status": "ok", "result": result}
         except KeyError:
             raise HTTPException(status_code=404, detail="refresh profile not found")
@@ -656,7 +658,7 @@ def build_admin_router(
             refresh_error = ""
             try:
                 refresh_result = refresh_manager.refresh_once(
-                    str(profile.get("id") or "")
+                    str(profile.get("id") or ""), allow_disabled_profile=True
                 )
             except Exception as exc:
                 refresh_error = str(exc)
@@ -702,7 +704,7 @@ def build_admin_router(
             refresh_failed_item = None
             try:
                 refresh_result = refresh_manager.refresh_once(
-                    str(profile.get("id") or "")
+                    str(profile.get("id") or ""), allow_disabled_profile=True
                 )
                 refreshed_item = {
                     "index": idx,
@@ -734,7 +736,11 @@ def build_admin_router(
             ]
             done_items = [future.result() for future in as_completed(futures)]
 
-        done_items.sort(key=lambda item: item["index"])
+        def import_result_index(item: dict[str, Any]) -> int:
+            index = item.get("index")
+            return index if isinstance(index, int) else 0
+
+        done_items.sort(key=import_result_index)
         for item in done_items:
             if item["imported"] is not None:
                 imported.append(item["imported"])
@@ -769,7 +775,9 @@ def build_admin_router(
     def refresh_profiles_refresh_now(profile_id: str, request: Request):
         require_admin_auth(request)
         try:
-            return refresh_manager.refresh_once(profile_id)
+            return refresh_manager.refresh_once(
+                profile_id, allow_disabled_profile=True
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail="profile not found")
         except ValueError as exc:
