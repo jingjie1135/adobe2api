@@ -3,5 +3,13 @@ __pycache__
 config/config.json
 config/tokens.json
 config/refresh_profile.json
+config/entities.json
 tokens.json
 .omo
+.playwright-mcp/
+chat-*-request-*.json
+chat-*-response-body.json
+chat-events-*-response-body.txt
+ai-assistant-chat.png
+page-*.png
+new_account_profile*.json

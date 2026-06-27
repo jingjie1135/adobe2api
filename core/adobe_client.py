@@ -12,6 +12,15 @@ from urllib.parse import quote, urlparse
 import requests
 
 from core.config_mgr import config_manager
+from core.assistant_client import (
+    AssistantGenerateRequest,
+    AssistantHttpGateway,
+    generate_gpt_image_with_assistant,
+)
+from core.assistant_errors import (
+    AssistantClientError,
+    AssistantHttpError,
+)
 from core.models import build_image_payload_candidates
 
 try:
@@ -121,11 +130,21 @@ class UpstreamTemporaryError(AdobeRequestError):
 
 class AdobeClient:
     submit_url = "https://firefly-3p.ff.adobe.io/v2/3p-images/generate-async"
+    assistant_start_url = "https://adobe-chat-harness-va6.adobe.io/api/v1/chats/start"
     video_submit_url = "https://firefly-3p.ff.adobe.io/v2/3p-videos/generate-async"
     upload_url = "https://firefly-3p.ff.adobe.io/v2/storage/image"
     entity_api_base = "https://firefly-entity.adobe.io/api/entities/"
     platform_cs_index_url = "https://platform-cs-edge.adobe.io/index"
     platform_cs_base = "https://platform-cs-va6.adobe.io/composite/component/path"
+    assistant_feature_flags = [
+        "skill.experimentalBrands",
+        "tool.experimentalBrands",
+        "tool.experimentalInDesign",
+        "feature.suggestPrompts",
+        "tool.experimentalSharing",
+        "tool.experimentalWalnut",
+        "tool.experimentalFireflyBoards",
+    ]
 
     def __init__(self) -> None:
         self.api_key = "clio-playground-web"
@@ -334,6 +353,25 @@ class AdobeClient:
             "x-api-key": self.api_key,
             "content-type": "application/json",
             "accept": "*/*",
+        }
+
+    def _assistant_headers(self, token: str, accept: str = "*/*") -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {token}",
+            "x-api-key": self.api_key,
+            "content-type": "application/json",
+            "accept": accept,
+            "origin": "https://firefly.adobe.com",
+            "referer": "https://firefly.adobe.com/",
+            "user-agent": self.user_agent,
+            "accept-language": "zh-HANS",
+            "sec-ch-ua": self.sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "x-session-id": str(uuid.uuid4()),
         }
 
     def _video_submit_headers(self, token: str) -> dict[str, str]:
@@ -948,6 +986,57 @@ class AdobeClient:
             source_image_ids=source_image_ids,
         )
 
+    def _generate_with_assistant(
+        self,
+        token: str,
+        prompt: str,
+        aspect_ratio: str,
+        output_resolution: str,
+        quality_level: Optional[str] = None,
+        detail_level: Optional[int] = None,
+        timeout: int = 180,
+        out_path: Optional[Path] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> tuple[Optional[bytes], dict]:
+        try:
+            return generate_gpt_image_with_assistant(
+                AssistantGenerateRequest(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    output_resolution=output_resolution,
+                    quality_level=quality_level,
+                    detail_level=detail_level,
+                    timeout=timeout,
+                    out_path=out_path,
+                    progress_cb=progress_cb,
+                ),
+                AssistantHttpGateway(
+                    start_url=self.assistant_start_url,
+                    feature_flags=self.assistant_feature_flags,
+                    post_json=lambda url, headers, payload: self._post_json(
+                        url, headers=headers, payload=payload
+                    ),
+                    get=lambda url, headers, request_timeout: self._get(
+                        url, headers=headers, timeout=request_timeout
+                    ),
+                    download_to_file=lambda url, headers, path, request_timeout: self._download_to_file(
+                        url, headers=headers, out_path=path, timeout=request_timeout
+                    ),
+                    headers=self._assistant_headers,
+                ),
+            )
+        except AssistantHttpError as exc:
+            if exc.status_code in (401, 403):
+                raise AuthError("Token invalid or missing AI Assistant scopes") from exc
+            if exc.status_code in (429, 451) or exc.status_code >= 500:
+                raise UpstreamTemporaryError(
+                    str(exc), status_code=exc.status_code, error_type="status"
+                ) from exc
+            raise AdobeRequestError(str(exc)) from exc
+        except AssistantClientError as exc:
+            raise AdobeRequestError(str(exc)) from exc
+
     @staticmethod
     def _video_size(aspect_ratio: str, resolution: str = "720p") -> dict:
         res = str(resolution or "720p").lower()
@@ -1529,6 +1618,22 @@ class AdobeClient:
                 submit_resp.status_code,
                 submit_resp.text[:500],
             )
+            if (
+                submit_resp.status_code == 408
+                and str(upstream_model_id or "").strip().lower() == "gpt-image"
+                and not source_image_ids
+            ):
+                return self._generate_with_assistant(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    output_resolution=output_resolution,
+                    quality_level=quality_level,
+                    detail_level=detail_level,
+                    timeout=timeout,
+                    out_path=out_path,
+                    progress_cb=progress_cb,
+                )
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
                 raise UpstreamTemporaryError(
                     format_upstream_status_message(
